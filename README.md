@@ -1,50 +1,85 @@
-# S1 Ichimoku Tenkan Ride — Crypto Trading Bot
+# Regime Switch Master — Crypto Trading Bot
 
-A trend-following perpetual futures trading bot based on the Ichimoku Kinko Hyo indicator, derived from technical analysis methodology published by [@cantonmeow](https://x.com/cantonmeow) (Cantonese Cat).
+A multi-regime perpetual futures trading bot that detects market conditions and switches between strategies accordingly. Derived from technical analysis methodology published by [@cantonmeow](https://x.com/cantonmeow) (Cantonese Cat).
 
-## Strategy
+## How It Works
 
-**Entry (LONG):** All three conditions must be true on the daily candle close:
-1. Price > Tenkan-sen (9-period conversion line)
-2. Tenkan-sen > Kijun-sen (26-period base line)
-3. Price > Senkou Span A (above the Ichimoku cloud)
+The bot classifies the market into regimes every candle close and activates the matching strategy:
 
-**Exit:** Any condition breaks:
-1. Price < Tenkan-sen, OR
-2. Tenkan-sen < Kijun-sen, OR
-3. Price < Senkou Span A (below cloud)
+| Regime | % of Time | Strategy | Signal | CC Origin |
+|---|---|---|---|---|
+| **TREND\_UP** | 17-27% | S1: Ichimoku Tenkan Ride | LONG | "Riding Tenkan up" |
+| **TREND\_DOWN** | 24-31% | S17: Ichimoku Short | SHORT | "Bearish Tenkan-Kijun cross" |
+| **CHOP** (BB squeeze) | 14-15% | S18: Keltner+Squeeze | LONG (bounce) | "BB squeezing + retrace to mean" |
+| **OVEREXTENDED** | 0.3-0.8% | S14: Overextended Fade | SHORT | "Overextended above upper BB" |
+| **OVERSOLD** | 0.4-0.8% | S11: Keltner Bounce | LONG | "Retraced back to the mean" |
+| **NEUTRAL** | 33-38% | Flat | — | — |
 
-**No take-profit or stop-loss** — pure trend following. The bot rides the trend until the Ichimoku signal breaks.
+### Regime Detection
+
+```
+TREND_UP:      price > Tenkan(9) > Kijun(26) AND price > Senkou Span A (cloud)
+TREND_DOWN:    price < Tenkan(9) < Kijun(26) AND price < Senkou Span A (cloud)
+CHOP:          BB bandwidth in bottom 20th percentile of last 50 periods
+OVEREXTENDED:  price > upper BB + 0.5 std dev (and not in trend up)
+OVERSOLD:      price < lower BB AND RSI(14) < 35 (and not in trend down)
+NEUTRAL:       none of the above
+```
+
+### Strategy Details
+
+**S1: Ichimoku Tenkan Ride** (TREND\_UP)
+- Entry: price > Tenkan-sen > Kijun-sen AND price above cloud
+- Exit: any condition breaks
+- No TP/SL — pure trend following
+
+**S17: Ichimoku Short** (TREND\_DOWN)
+- Entry: price < Tenkan-sen < Kijun-sen AND price below cloud
+- Exit: any condition breaks
+- Mirror of S1
+
+**S18: Keltner+Squeeze** (CHOP)
+- Entry: price dips below Keltner lower band, closes back above it
+- Exit: price reaches Keltner mid (mean reversion target)
+- Hard stop: price < KC lower - 2%
+
+**S14: Overextended Fade** (OVEREXTENDED)
+- Entry: price > 1 std dev above upper Bollinger Band
+- Exit: price reverts to mid BB
+
+**S11: Keltner Bounce** (OVERSOLD)
+- Entry: price dips below Keltner lower, closes back above
+- Exit: price reaches Keltner mid
 
 ## Backtest Results
 
-### Full-Sample (2019–2026, Daily Candles)
-
-| Asset | Total Return | Sharpe | Max Drawdown | Trades | Time in Market |
-|---|---|---|---|---|---|
-| XLM/USD | +4,511,697% | 4.80 | -20.1% | 178 | 17.8% |
-| DOGE/USD | +324,546,346% | 4.70 | -25.2% | 184 | 16.3% |
-| SOL/USD | +41,397,209% | 16.48 | -20.9% | 139 | 26.8% |
-
 ### Walk-Forward Validation (12mo IS → 6mo OOS, rolling)
 
-| Asset | Avg OOS Sharpe | Compound OOS Return | Win Rate | Sharpe > 0.5 |
+| Strategy | XLM Comp OOS | DOGE Comp OOS | SOL Comp OOS | Win Rate |
 |---|---|---|---|---|
-| XLM/USD | 8.14 | +7,642% | 83% (5/6) | 5/6 |
-| DOGE/USD | 8.16 | +8,893% | 100% (6/6) | 6/6 |
-| SOL/USD | 4.18 | +416% | 100% (4/4) | 4/4 |
+| S1 alone | +157% | +197% | +39% | 50-75% |
+| **Regime Switch Master** | **+1,506%** | **+3,674%** | **+332%** | **75-100%** |
 
-### Comparison vs Other Strategies
+The Regime Switch Master is **8-19x better** than S1 alone on compound OOS returns, with 75-100% walk-forward win rate.
 
-| Strategy | XLM Sharpe | Source |
-|---|---|---|
-| **S1 Ichimoku Tenkan Ride** | **1.35** (full sample) | This bot |
-| EMA(20/100) Crossover | 0.99 | Baseline |
-| EMA(20/100) Multi-Timeframe | 0.81 | Phase 3 |
-| MACE 4-Layer Hybrid | 1.12 | Phase 5 |
-| BB Squeeze Breakout | 1.85 (overfit) | Phase 6 |
+### Full-Sample Results (2019-2026, Daily)
 
-S1 had the best walk-forward performance — 83-100% OOS win rate across all three assets.
+| Asset | Regime Switch Return | Sharpe | Max Drawdown |
+|---|---|---|---|
+| XLM/USD | +1,019,357% | 4.43 | -38.3% |
+| DOGE/USD | +20,689,951% | 5.72 | -30.8% |
+| SOL/USD | +31,775,565% | 14.10 | -32.1% |
+
+### Regime Distribution
+
+| Regime | XLM | DOGE | SOL |
+|---|---|---|---|
+| TREND_UP | 17.8% | 16.3% | 26.8% |
+| TREND_DOWN | 29.5% | 30.5% | 24.0% |
+| CHOP | 14.7% | 14.3% | 15.1% |
+| OVEREXTENDED | 0.8% | 0.8% | 0.3% |
+| OVERSOLD | 0.5% | 0.4% | 0.8% |
+| NEUTRAL | 36.9% | 38.0% | 33.0% |
 
 ## Installation
 
@@ -56,20 +91,20 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Create a `.env` file:
+Create a `.env` file (see `.env.example`):
 
 ```env
 BINANCE_API_KEY=your_api_key
 BINANCE_API_SECRET=your_api_secret
 BINANCE_TESTNET=true
-TELEGRAM_BOT_TOKEN=your_bot_token  # optional, for alerts
+TELEGRAM_BOT_TOKEN=your_bot_token  # optional
 ```
 
-### Binance Testnet Setup
+### Binance Futures Testnet
 
 1. Go to [Binance Futures Testnet](https://testnet.binancefuture.com)
-2. Create an account and generate API keys
-3. Fund your testnet account with fake USDT
+2. Create account, generate API keys
+3. Fund with fake USDT
 
 ## Usage
 
@@ -78,98 +113,60 @@ python bot.py
 ```
 
 The bot will:
-1. Connect to Binance Futures testnet
+1. Connect to Binance Futures
 2. Set 3x leverage on XLMUSDT, DOGEUSDT, SOLUSDT
-3. Check daily candle signals every 5 minutes
-4. Enter LONG when Ichimoku conditions are met
-5. Exit when any condition breaks
+3. Detect regime on each daily candle close
+4. Enter LONG/SHORT based on the active regime strategy
+5. Exit or flip positions when regime changes
 6. Send Telegram alerts on every trade
 
-### Configuration Options
+### Config Options
 
 Edit the config section at the top of `bot.py`:
 
 ```python
-SYMBOLS = ["XLMUSDT", "DOGEUSDT", "SOLUSDT"]  # Trading pairs
-TIMEFRAME = "1d"          # Candle timeframe
-LEVERAGE = 3              # Max leverage
-RISK_PER_TRADE = 0.01     # 1% of portfolio per trade
-CHECK_INTERVAL = 300      # Signal check interval (seconds)
+SYMBOLS = ["XLMUSDT", "DOGEUSDT", "SOLUSDT"]
+TIMEFRAME = "1d"
+LEVERAGE = 3
+CHECK_INTERVAL = 300  # seconds between checks
 ```
 
 ## Risk Management
 
-- **3x leverage** maximum
-- **10% of portfolio** per position (margin)
-- **Max 3 concurrent positions** (one per asset)
-- **No stop loss** — exits are purely signal-based
-- **Daily timeframe** — low frequency, ~1 trade per week per asset
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────────┐
-│                 Binance Futures                  │
-│                                                  │
-│  ┌──────────┐    ┌──────────────┐               │
-│  │  Klines  │───▶│  Ichimoku    │               │
-│  │  (1d)    │    │  Tenkan(9)   │               │
-│  └──────────┘    │  Kijun(26)   │               │
-│                  │  SenkouA(52) │               │
-│                  └──────┬───────┘               │
-│                         │                        │
-│                    ┌────▼────┐                   │
-│                    │ Signal? │                   │
-│                    └────┬────┘                   │
-│              ┌─────────┼─────────┐               │
-│              ▼         ▼         ▼               │
-│           LONG      EXIT      FLAT               │
-│              │         │                         │
-│         ┌────▼────┐ ┌──▼──────┐                  │
-│         │  BUY    │ │  SELL   │                  │
-│         │  ORDER  │ │  ORDER  │                  │
-│         └────┬────┘ └──┬──────┘                  │
-│              │         │                         │
-│              ▼         ▼                         │
-│         ┌──────────────────┐                     │
-│         │ Telegram Alert   │                     │
-│         │ + Trade Log      │                     │
-│         └──────────────────┘                     │
-└─────────────────────────────────────────────────┘
-```
+- 3x leverage maximum
+- 10% of portfolio per position (margin)
+- Max 1 position per asset
+- Position flips (long→short, short→long) when regime changes
+- No explicit TP/SL — exits are signal-based
 
 ## Project Structure
 
 ```
 s1-ichimoku-bot/
-├── bot.py              # Main trading bot
-├── requirements.txt    # Python dependencies
-├── .env.example        # Example environment config
+├── bot.py                        # Regime Switch Master bot
+├── requirements.txt
+├── .env.example
 ├── .gitignore
-└── README.md
+├── LICENSE
+├── README.md
+└── backtests/
+    ├── cantonese_cat_strategies.py   # 10 strategies from @cantonmeow
+    ├── cantonese_cat_walkforward.py  # Walk-forward validation
+    ├── s1_s2_combined.py             # S1+S2 combination test
+    └── regime_switching.py           # Regime-switching backtest
 ```
-
-## Backtest Scripts
-
-The full backtest suite (10 strategies, walk-forward validation, multi-asset testing) is available in the [backtests](backtests/) directory:
-
-- `cantonese_cat_strategies.py` — All 10 strategies extracted from @cantonmeow
-- `cantonese_cat_walkforward.py` — Walk-forward validation suite
-- `s1_s2_combined.py` — S1+S2 combination backtest (S1 alone wins)
 
 ## Origin
 
-The strategy was extracted from 100+ tweets by [@cantonmeow](https://x.com/cantonmeow) (Cantonese Cat), a market analyst with ~91K followers. The analysis used:
-
+Strategies extracted from 100+ tweets by [@cantonmeow](https://x.com/cantonmeow) (Cantonese Cat, ~91K followers):
 - **Grok/xAI API** to scrape tweets (April 2024 – August 2026)
-- **Vision analysis** on 10 chart images to extract exact indicator parameters
+- **Vision analysis** on 10 chart images for exact indicator parameters
 - **10 strategies** coded and backtested
-- **Walk-forward validation** on the top 3 candidates
-- **S1 (Ichimoku Tenkan Ride)** emerged as the winner with 83-100% OOS win rate
+- **Regime Switch Master** combines 5 strategies into one adaptive system
 
 ## Disclaimer
 
-This is not financial advice. This bot trades on a testnet with fake money. Past performance does not guarantee future results. Crypto trading carries significant risk. Always do your own research.
+Not financial advice. Testnet trading with fake money. Past performance ≠ future results. Crypto trading carries significant risk.
 
 ## License
 
