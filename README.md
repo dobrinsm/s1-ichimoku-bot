@@ -1,27 +1,25 @@
-# Regime Switch Master — Crypto Trading Bot
+# Regime Switch Master — Crypto Trading Bot (v2)
 
 A multi-regime perpetual futures trading bot that detects market conditions and switches between strategies accordingly. Derived from technical analysis methodology published by [@cantonmeow](https://x.com/cantonmeow) (Cantonese Cat).
 
 ## How It Works
 
-The bot classifies the market into regimes every candle close and activates the matching strategy:
+The bot classifies the market into regimes every daily candle close and activates the matching strategy. **v2 is long-only** — shorting was removed after backtesting showed it loses money on crypto daily (see [Backtest Results](#backtest-results)).
 
-| Regime | % of Time | Strategy | Signal | CC Origin |
-|---|---|---|---|---|
-| **TREND\_UP** | 17-27% | S1: Ichimoku Tenkan Ride | LONG | "Riding Tenkan up" |
-| **TREND\_DOWN** | 24-31% | S17: Ichimoku Short | SHORT | "Bearish Tenkan-Kijun cross" |
-| **CHOP** (BB squeeze) | 14-15% | S18: Keltner+Squeeze | LONG (bounce) | "BB squeezing + retrace to mean" |
-| **OVEREXTENDED** | 0.3-0.8% | S14: Overextended Fade | SHORT | "Overextended above upper BB" |
-| **OVERSOLD** | 0.4-0.8% | S11: Keltner Bounce | LONG | "Retraced back to the mean" |
-| **NEUTRAL** | 33-38% | Flat | — | — |
+| Regime | % of Time | Strategy | Signal |
+|---|---|---|---|
+| **TREND\_UP** | 17-27% | S1: Ichimoku Tenkan Ride | LONG |
+| **TREND\_DOWN** | 24-31% | Flat | — |
+| **CHOP** (BB squeeze) | 14-15% | S18: Keltner+Squeeze | LONG (bounce off KC lower) |
+| **OVERSOLD** | 0.4-0.8% | S11: Keltner Bounce | LONG |
+| **NEUTRAL** | 33-38% | Flat | — |
 
 ### Regime Detection
 
 ```
-TREND_UP:      price > Tenkan(9) > Kijun(26) AND price > Senkou Span A (cloud)
-TREND_DOWN:    price < Tenkan(9) < Kijun(26) AND price < Senkou Span A (cloud)
+TREND_UP:      price > Tenkan(9) > Kijun(26) AND price > cloud_top = max(Senkou A, Senkou B)
+TREND_DOWN:    price < Tenkan(9) < Kijun(26) AND price < Senkou A  (detected but NOT shorted)
 CHOP:          BB bandwidth in bottom 20th percentile of last 50 periods
-OVEREXTENDED:  price > upper BB + 0.5 std dev (and not in trend up)
 OVERSOLD:      price < lower BB AND RSI(14) < 35 (and not in trend down)
 NEUTRAL:       none of the above
 ```
@@ -29,57 +27,51 @@ NEUTRAL:       none of the above
 ### Strategy Details
 
 **S1: Ichimoku Tenkan Ride** (TREND\_UP)
-- Entry: price > Tenkan-sen > Kijun-sen AND price above cloud
-- Exit: any condition breaks
+- Entry: price > Tenkan-sen > Kijun-sen AND price above full cloud (Senkou A & B)
+- Exit: any condition breaks (regime changes to non-TREND_UP)
 - No TP/SL — pure trend following
 
-**S17: Ichimoku Short** (TREND\_DOWN)
-- Entry: price < Tenkan-sen < Kijun-sen AND price below cloud
-- Exit: any condition breaks
-- Mirror of S1
-
 **S18: Keltner+Squeeze** (CHOP)
-- Entry: price dips below Keltner lower band, closes back above it
-- Exit: price reaches Keltner mid (mean reversion target)
-- Hard stop: price < KC lower - 2%
-
-**S14: Overextended Fade** (OVEREXTENDED)
-- Entry: price > 1 std dev above upper Bollinger Band
-- Exit: price reverts to mid BB
+- Entry: was in squeeze recently (BB BW < 25th pctile in last 15 bars) + price dips below Keltner lower + closes back above
+- Exit: price reaches BB upper (take profit)
+- Stop: price < KC lower × 0.98
 
 **S11: Keltner Bounce** (OVERSOLD)
-- Entry: price dips below Keltner lower, closes back above
-- Exit: price reaches Keltner mid
+- Entry: squeeze context + price dips below Keltner lower + closes back above
+- Exit: price reaches Keltner mid (mean reversion target)
+- Stop: price < KC lower × 0.98
+
+### What Changed in v2
+
+| Change | v1 | v2 |
+|---|---|---|
+| Shorting | S17 + S14 (shorts) | Removed — loses money on crypto daily |
+| Ichimoku cloud | Senkou A only | Full cloud: max(Senkou A, Senkou B) |
+| S18 exit | KC mid (too early) | BB upper (captures more profit) |
+| S18 entry | Single bar check | Rolling 15-bar squeeze context |
+| Position limit | Unlimited | Max 3 concurrent positions |
+| Stale shorts | — | Auto-closes v1 shorts on startup |
 
 ## Backtest Results
 
-### Walk-Forward Validation (12mo IS → 6mo OOS, rolling)
+### v1 vs v2 Comparison (2020-2026, daily candles)
 
-| Strategy | XLM Comp OOS | DOGE Comp OOS | SOL Comp OOS | Win Rate |
+| Asset | v1 Sharpe | v2 Sharpe | v1 Return | v2 Return | v1 Trades | v2 Trades |
+|---|---|---|---|---|---|---|
+| XLM/USD | 0.08 | 0.48 | +46% | +496% | 469 | 194 |
+| DOGE/USD | 0.41 | 0.56 | +696% | +1,015% | 431 | 176 |
+| SOL/USD | 1.32 | 2.08 | +7,579% | +15,797% | 338 | 153 |
+
+### Walk-Forward Validation (12mo IS → 6mo OOS)
+
+| Strategy | DOGE Comp OOS | DOGE Win Rate | SOL Comp OOS | SOL Win Rate |
 |---|---|---|---|---|
-| S1 alone | +157% | +197% | +39% | 50-75% |
-| **Regime Switch Master** | **+1,506%** | **+3,674%** | **+332%** | **75-100%** |
+| S1 alone | +364% | 80% | +363% | 80% |
+| **Bot v2 (long-only)** | **+587%** | **100%** | **+274%** | **80%** |
 
-The Regime Switch Master is **8-19x better** than S1 alone on compound OOS returns, with 75-100% walk-forward win rate.
+### Why Shorting Was Removed
 
-### Full-Sample Results (2019-2026, Daily)
-
-| Asset | Regime Switch Return | Sharpe | Max Drawdown |
-|---|---|---|---|
-| XLM/USD | +1,019,357% | 4.43 | -38.3% |
-| DOGE/USD | +20,689,951% | 5.72 | -30.8% |
-| SOL/USD | +31,775,565% | 14.10 | -32.1% |
-
-### Regime Distribution
-
-| Regime | XLM | DOGE | SOL |
-|---|---|---|---|
-| TREND_UP | 17.8% | 16.3% | 26.8% |
-| TREND_DOWN | 29.5% | 30.5% | 24.0% |
-| CHOP | 14.7% | 14.3% | 15.1% |
-| OVEREXTENDED | 0.8% | 0.8% | 0.3% |
-| OVERSOLD | 0.5% | 0.4% | 0.8% |
-| NEUTRAL | 36.9% | 38.0% | 33.0% |
+S17 (Ichimoku short) alone returned **-66% on XLM, -38% DOGE, -70% SOL** over 2020-2026. Crypto's structural upward bias makes shorting negative expected value on daily timeframes, even with regime detection. The bot was shorting ~47% of the time, dragging Sharpe from 0.48 (long-only) down to 0.08.
 
 ## Installation
 
@@ -115,10 +107,11 @@ python bot.py
 The bot will:
 1. Connect to Binance Futures
 2. Set 3x leverage on XLMUSDT, DOGEUSDT, SOLUSDT
-3. Detect regime on each daily candle close
-4. Enter LONG/SHORT based on the active regime strategy
-5. Exit or flip positions when regime changes
-6. Send Telegram alerts on every trade
+3. Auto-close any stale short positions from v1
+4. Detect regime on each daily candle close
+5. Enter LONG based on the active regime strategy
+6. Exit when regime changes or take-profit target hit
+7. Send Telegram alerts on every trade
 
 ### Config Options
 
@@ -128,22 +121,22 @@ Edit the config section at the top of `bot.py`:
 SYMBOLS = ["XLMUSDT", "DOGEUSDT", "SOLUSDT"]
 TIMEFRAME = "1d"
 LEVERAGE = 3
-CHECK_INTERVAL = 300  # seconds between checks
+CHECK_INTERVAL = 3600  # seconds between checks
 ```
 
 ## Risk Management
 
 - 3x leverage maximum
 - 10% of portfolio per position (margin)
-- Max 1 position per asset
-- Position flips (long→short, short→long) when regime changes
-- No explicit TP/SL — exits are signal-based
+- Max 3 concurrent positions (30% balance utilization)
+- No shorting — long/flat only
+- No explicit TP/SL — exits are signal-based (regime change or mean reversion target)
 
 ## Project Structure
 
 ```
 s1-ichimoku-bot/
-├── bot.py                        # Regime Switch Master bot
+├── bot.py                        # Regime Switch Master bot (v2)
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
@@ -162,7 +155,7 @@ Strategies extracted from 100+ tweets by [@cantonmeow](https://x.com/cantonmeow)
 - **Grok/xAI API** to scrape tweets (April 2024 – August 2026)
 - **Vision analysis** on 10 chart images for exact indicator parameters
 - **10 strategies** coded and backtested
-- **Regime Switch Master** combines 5 strategies into one adaptive system
+- **Regime Switch Master** combines strategies into one adaptive system
 
 ## Disclaimer
 
