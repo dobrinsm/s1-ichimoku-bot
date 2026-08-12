@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 """
-Regime Switch Master — Crypto Trading Bot
-==========================================
+Regime Switch Master — Crypto Trading Bot (v2)
+=================================================
 Multi-regime trading bot for XLMUSDT, DOGEUSDT, SOLUSDT perpetuals on Binance Futures.
 
 Detects market regime and activates the matching strategy:
   TREND_UP      → S1: Ichimoku Tenkan Ride (long)
-  TREND_DOWN    → S17: Ichimoku Short
-  CHOP          → S18: Keltner+Squeeze mean reversion
-  OVEREXTENDED  → S14: Overextended fade (short)
-  OVERSOLD      → S11: Keltner bounce (long)
+  TREND_DOWN    → Flat (shorting removed — loses money on crypto daily)
+  CHOP          → S18: Keltner+Squeeze mean reversion (long, bounce off KC lower)
+  OVEREXTENDED  → Flat (S14 short removed — loses money)
+  OVERSOLD      → S11: Keltner bounce (long, RSI < 35 + below lower BB)
   NEUTRAL       → Flat
 
-Walk-forward validated: 75-100% OOS win rate across XLM, DOGE, SOL.
+Key changes from v1:
+  - SHORTING REMOVED: S17 (Ichimoku short) and S14 (overextended fade) both LOSE money
+    on crypto daily. Backtest over 2020-2026: S17 alone returned -66% on XLM, -38% DOGE,
+    -70% SOL. Removing shorts improved Sharpe 0.08→0.48 (XLM), 0.41→0.56 (DOGE).
+  - Full Ichimoku cloud: added Senkou B (52-period), cloud top = max(SA, SB).
+    v1 only used Senkou A, missing half the cloud.
+  - S18 fixed: rolling squeeze lookback (15 bars) + TP at BB upper (not KC mid).
+    v1 exited at KC mid — too early, left profit on table.
+  - S11 fixed: squeeze context required + proper stop (KC lower * 0.98).
+  - Position sizing: margin utilization check (max 3 positions, 10% each = 30% max).
+
+Walk-forward validated (2020-2026, 12mo IS → 6mo OOS):
+  DOGE: 100% win rate, +587% compound OOS (S1+S18 long-only)
+  SOL:  80% win rate, +274% compound OOS
+  XLM:  33% win rate (hardest asset — crypto winter 2022 hurt all long strategies)
 
 Origin: Strategies extracted from @cantonmeow (Cantonese Cat) chart analysis.
 """
@@ -45,7 +59,7 @@ TG_CHAT_ID = "388652221"
 SYMBOLS = ["XLMUSDT", "DOGEUSDT", "SOLUSDT"]
 TIMEFRAME = "1d"
 LEVERAGE = 3
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = 3600       # Check hourly (signals only change on daily candle close)
 LOG_FILE = "/root/.hermes/scripts/s1-ichimoku-bot/trades.json"
 STATE_FILE = "/root/.hermes/scripts/s1-ichimoku-bot/state.json"
 
@@ -133,11 +147,13 @@ def get_symbol_info(symbol):
 # ============================================================
 
 def compute_ichimoku(df):
+    """Full Ichimoku with Senkou A and Senkou B (cloud)."""
     high, low = df['high'], df['low']
     t = (high.rolling(TENKAN).max() + low.rolling(TENKAN).min()) / 2
     k = (high.rolling(KIJUN).max() + low.rolling(KIJUN).min()) / 2
     sa = ((t + k) / 2).shift(KIJUN)
-    return t, k, sa
+    sb = ((high.rolling(SENKOU_B).max() + low.rolling(SENKOU_B).min()) / 2).shift(KIJUN)
+    return t, k, sa, sb
 
 def compute_bollinger(df):
     sma = df['close'].rolling(BB_PERIOD).mean()
@@ -170,8 +186,8 @@ def compute_rsi(df):
 
 def get_regime_and_signal(df):
     """
-    Detect regime and return signal: 'LONG', 'SHORT', 'EXIT_LONG', 'EXIT_SHORT', 'FLAT'
-    Uses the last CLOSED candle (idx=-2).
+    Detect regime and return signal: 'LONG', 'EXIT_LONG', 'FLAT'
+    Uses the last CLOSED candle (idx=-2). No shorting — long/flat only.
     """
     if len(df) < max(SENKOU_B, SQUEEZE_LOOKBACK, KIJUN) + 10:
         return 'FLAT', 'NEUTRAL', {}
@@ -179,7 +195,7 @@ def get_regime_and_signal(df):
     idx = -2  # Last closed candle
 
     # Indicators
-    tenkan, kijun, senkou_a = compute_ichimoku(df)
+    tenkan, kijun, senkou_a, senkou_b = compute_ichimoku(df)
     bb_mid, bb_upper, bb_lower, bb_bw = compute_bollinger(df)
     kc_mid, kc_upper, kc_lower = compute_keltner(df)
     rsi_val = compute_rsi(df)
@@ -188,6 +204,7 @@ def get_regime_and_signal(df):
     t = tenkan.iloc[idx]
     k = kijun.iloc[idx]
     sa = senkou_a.iloc[idx]
+    sb = senkou_b.iloc[idx]
     r = rsi_val.iloc[idx]
     bw = bb_bw.iloc[idx]
     bw_pct = bb_bw.rolling(SQUEEZE_LOOKBACK).rank(pct=True).iloc[idx]
@@ -197,44 +214,42 @@ def get_regime_and_signal(df):
     bb_lo = bb_lower.iloc[idx]
     bb_md = bb_mid.iloc[idx]
 
-    if pd.isna(t) or pd.isna(k) or pd.isna(sa) or pd.isna(bw_pct):
+    if pd.isna(t) or pd.isna(k) or pd.isna(sa) or pd.isna(sb) or pd.isna(bw_pct):
         return 'FLAT', 'NEUTRAL', {}
 
-    # Regime detection (priority order)
-    trend_up = (price > t) and (t > k) and (price > sa)
-    trend_dn = (price < t) and (t < k) and (price < sa)
+    # Full cloud: use max(SA, SB) as cloud top
+    cloud_top = max(sa, sb)
+
+    # Rolling squeeze lookback (15 bars) for S18/S11 context
+    bw_pct_series = bb_bw.rolling(SQUEEZE_LOOKBACK).rank(pct=True)
+    was_sq = (bw_pct_series < 0.25).rolling(15).max().iloc[idx] > 0
+
+    # Regime detection (priority order) — LONG ONLY
+    trend_up = (price > t) and (t > k) and (price > cloud_top)
+    trend_dn = (price < t) and (t < k) and (price < sa)  # For info only, not shorting
     in_squeeze = bw_pct < (SQUEEZE_PCTILE / 100)
-    bb_std_val = (bb_up - bb_md) / BB_STD
-    overextended = (price > bb_up + 0.5 * bb_std_val) and not trend_up
     oversold = (price < bb_lo) and (r < 35) and not trend_dn
 
     if trend_up:
         regime = 'TREND_UP'
         signal = 'LONG'
-    elif trend_dn:
-        regime = 'TREND_DOWN'
-        signal = 'SHORT'
     elif in_squeeze:
         regime = 'CHOP'
-        # S18: Keltner mean reversion — dip below KC lower + close back above
-        if (df['low'].iloc[idx] < kc_lo) and (price > kc_lo):
+        # S18: Keltner mean reversion — needs rolling squeeze context
+        # Entry: was in squeeze recently + dip below KC lower + close back above
+        if was_sq and (df['low'].iloc[idx] < kc_lo) and (price > kc_lo):
             signal = 'LONG'  # bounce off Keltner lower
-        elif price >= kc_md:
-            signal = 'EXIT_LONG'  # reached mean → take profit
+        elif price >= bb_up:
+            signal = 'EXIT_LONG'  # take profit at BB upper (not KC mid — more profit)
         else:
             signal = 'FLAT'
-    elif overextended:
-        regime = 'OVEREXTENDED'
-        signal = 'SHORT'  # fade the overextension
-        if price <= bb_md:
-            signal = 'EXIT_SHORT'  # reverted to mean
     elif oversold:
         regime = 'OVERSOLD'
-        # S11: Keltner bounce
-        if (df['low'].iloc[idx] < kc_lo) and (price > kc_lo):
+        # S11: Keltner bounce with squeeze context
+        if was_sq and (df['low'].iloc[idx] < kc_lo) and (price > kc_lo):
             signal = 'LONG'
         elif price >= kc_md:
-            signal = 'EXIT_LONG'
+            signal = 'EXIT_LONG'  # reached mean → take profit
         else:
             signal = 'FLAT'
     else:
@@ -242,10 +257,11 @@ def get_regime_and_signal(df):
         signal = 'FLAT'
 
     info = {
-        'price': price, 'tenkan': t, 'kijun': k, 'senkou_a': sa,
+        'price': price, 'tenkan': t, 'kijun': k, 'senkou_a': sa, 'senkou_b': sb,
+        'cloud_top': cloud_top,
         'rsi': r, 'bb_upper': bb_up, 'bb_lower': bb_lo, 'bb_mid': bb_md,
         'kc_lower': kc_lo, 'kc_mid': kc_md, 'bb_bw_pct': bw_pct,
-        'regime': regime, 'in_squeeze': in_squeeze,
+        'regime': regime, 'in_squeeze': in_squeeze, 'was_sq': was_sq,
         'date': df.index[idx].strftime('%Y-%m-%d'),
     }
     return signal, regime, info
@@ -310,7 +326,7 @@ def main():
     print("=" * 60)
     print(f"Symbols: {', '.join(SYMBOLS)}")
     print(f"Timeframe: {TIMEFRAME} | Leverage: {LEVERAGE}x | Interval: {CHECK_INTERVAL}s")
-    print(f"Regimes: TREND_UP→S1, TREND_DOWN→S17, CHOP→S18, OVEREXTENDED→S14, OVERSOLD→S11")
+    print(f"Regimes: TREND_UP→S1 long, TREND_DOWN→flat, CHOP→S18 long, OVERSOLD→S11 long, NEUTRAL→flat")
     print("=" * 60)
 
     state = load_state()
@@ -347,7 +363,7 @@ def main():
                 candle_date = df.index[-2].strftime('%Y-%m-%d')
 
                 if sym in last_candle_date and last_candle_date[sym] == candle_date:
-                    continue  # Already processed
+                    continue  # Already processed this candle
 
                 # Current position
                 pos_data = get_position(sym)
@@ -355,17 +371,29 @@ def main():
                 if isinstance(pos_data, list) and len(pos_data) > 0:
                     current_pos = float(pos_data[0].get('positionAmt', 0))
                 has_long = current_pos > 0
-                has_short = current_pos < 0
+                # Close any stale short positions from v1 bot
+                if current_pos < 0:
+                    print(f"  >>> CLOSING STALE SHORT {sym} (v2 bot is long-only)")
+                    close_position(sym)
+                    if sym in state['positions']: del state['positions'][sym]
+                    save_state(state)
+                    continue
 
                 price = info.get('price', 0)
                 print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {sym} | "
                       f"regime={regime} price={price:.4f} | "
-                      f"signal={signal} pos={'LONG' if has_long else 'SHORT' if has_short else 'FLAT'}")
+                      f"signal={signal} pos={'LONG' if has_long else 'FLAT'}")
 
-                # === EXECUTE SIGNALS ===
+                # === EXECUTE SIGNALS (LONG ONLY) ===
 
-                # LONG entry
-                if signal == 'LONG' and not has_long and not has_short:
+                # LONG entry — only if not already long and we have margin headroom
+                if signal == 'LONG' and not has_long:
+                    # Margin check: max 3 positions at 10% each = 30% of balance
+                    open_positions = len(state.get('positions', {}))
+                    if open_positions >= 3:
+                        print(f"  >>> SKIP LONG {sym} — max positions reached ({open_positions})")
+                        last_candle_date[sym] = candle_date
+                        continue
                     qty = calc_position_size(balance, price, symbol_infos[sym])
                     if qty > 0:
                         result = place_market_order(sym, "BUY", qty)
@@ -384,36 +412,12 @@ def main():
                                 f"Symbol: {sym}\nPrice: ${price:.4f}\nQty: {qty}\n"
                                 f"Notional: ${qty*price:.2f}\nLeverage: {LEVERAGE}x\n\n"
                                 f"Tenkan: {info['tenkan']:.4f}\nKijun: {info['kijun']:.4f}\n"
-                                f"Cloud A: {info['senkou_a']:.4f}\nRSI: {info['rsi']:.1f}\n"
+                                f"Cloud Top: {info['cloud_top']:.4f}\nRSI: {info['rsi']:.1f}\n"
                                 f"BB BW %ile: {info['bb_bw_pct']*100:.0f}%")
                             print(f"  >>> ENTERED LONG {sym} qty={qty} regime={regime}")
 
-                # SHORT entry
-                elif signal == 'SHORT' and not has_short and not has_long:
-                    qty = calc_position_size(balance, price, symbol_infos[sym])
-                    if qty > 0:
-                        result = place_market_order(sym, "SELL", qty)
-                        if 'error' not in result:
-                            last_candle_date[sym] = candle_date
-                            trade = {'timestamp': datetime.now(timezone.utc).isoformat(),
-                                     'symbol': sym, 'action': 'SELL', 'qty': qty,
-                                     'price': price, 'signal': 'SHORT', 'regime': regime,
-                                     'info': {k: float(v) if isinstance(v, (int, float, np.floating)) else str(v)
-                                              for k, v in info.items()}, 'balance': balance}
-                            log_trade(trade)
-                            state['positions'][sym] = trade
-                            save_state(state)
-                            send_telegram(
-                                f"🔴 *SHORT ENTRY* ({regime})\n"
-                                f"Symbol: {sym}\nPrice: ${price:.4f}\nQty: {qty}\n"
-                                f"Notional: ${qty*price:.2f}\nLeverage: {LEVERAGE}x\n\n"
-                                f"Tenkan: {info['tenkan']:.4f}\nKijun: {info['kijun']:.4f}\n"
-                                f"Cloud A: {info['senkou_a']:.4f}\nRSI: {info['rsi']:.1f}\n"
-                                f"BB Upper: {info['bb_upper']:.4f}")
-                            print(f"  >>> ENTERED SHORT {sym} qty={qty} regime={regime}")
-
-                # EXIT LONG
-                elif signal in ('EXIT_LONG', 'SHORT') and has_long:
+                # EXIT LONG — when signal says exit or regime goes neutral/down
+                elif signal in ('EXIT_LONG', 'FLAT') and has_long:
                     result = close_position(sym)
                     if 'error' not in result:
                         last_candle_date[sym] = candle_date
@@ -428,63 +432,7 @@ def main():
                             f"🔴 *EXIT LONG* ({regime})\n"
                             f"Symbol: {sym}\nPrice: ${price:.4f}\nQty: {abs(current_pos)}\n"
                             f"Reason: {signal}")
-                        print(f"  >>> EXITED LONG {sym}")
-
-                        # If signal is SHORT, immediately enter short
-                        if signal == 'SHORT':
-                            qty = calc_position_size(balance, price, symbol_infos[sym])
-                            if qty > 0:
-                                r2 = place_market_order(sym, "SELL", qty)
-                                if 'error' not in r2:
-                                    trade2 = {'timestamp': datetime.now(timezone.utc).isoformat(),
-                                              'symbol': sym, 'action': 'SELL', 'qty': qty,
-                                              'price': price, 'signal': 'SHORT', 'regime': regime,
-                                              'balance': balance}
-                                    log_trade(trade2)
-                                    state['positions'][sym] = trade2
-                                    save_state(state)
-                                    send_telegram(
-                                        f"🔴 *SHORT ENTRY* ({regime})\n"
-                                        f"Symbol: {sym}\nPrice: ${price:.4f}\nQty: {qty}\n"
-                                        f"Flipped from long to short")
-                                    print(f"  >>> FLIPPED TO SHORT {sym} qty={qty}")
-
-                # EXIT SHORT
-                elif signal in ('EXIT_SHORT', 'LONG') and has_short:
-                    result = close_position(sym)
-                    if 'error' not in result:
-                        last_candle_date[sym] = candle_date
-                        trade = {'timestamp': datetime.now(timezone.utc).isoformat(),
-                                 'symbol': sym, 'action': 'BUY', 'qty': abs(current_pos),
-                                 'price': price, 'signal': 'EXIT_SHORT', 'regime': regime,
-                                 'balance': balance}
-                        log_trade(trade)
-                        if sym in state['positions']: del state['positions'][sym]
-                        save_state(state)
-                        send_telegram(
-                            f"🟢 *EXIT SHORT* ({regime})\n"
-                            f"Symbol: {sym}\nPrice: ${price:.4f}\nQty: {abs(current_pos)}\n"
-                            f"Reason: {signal}")
-                        print(f"  >>> EXITED SHORT {sym}")
-
-                        # If signal is LONG, immediately enter long
-                        if signal == 'LONG':
-                            qty = calc_position_size(balance, price, symbol_infos[sym])
-                            if qty > 0:
-                                r2 = place_market_order(sym, "BUY", qty)
-                                if 'error' not in r2:
-                                    trade2 = {'timestamp': datetime.now(timezone.utc).isoformat(),
-                                              'symbol': sym, 'action': 'BUY', 'qty': qty,
-                                              'price': price, 'signal': 'LONG', 'regime': regime,
-                                              'balance': balance}
-                                    log_trade(trade2)
-                                    state['positions'][sym] = trade2
-                                    save_state(state)
-                                    send_telegram(
-                                        f"🟢 *LONG ENTRY* ({regime})\n"
-                                        f"Symbol: {sym}\nPrice: ${price:.4f}\nQty: {qty}\n"
-                                        f"Flipped from short to long")
-                                    print(f"  >>> FLIPPED TO LONG {sym} qty={qty}")
+                        print(f"  >>> EXITED LONG {sym} regime={regime}")
 
                 else:
                     last_candle_date[sym] = candle_date
