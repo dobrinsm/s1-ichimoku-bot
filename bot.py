@@ -132,8 +132,14 @@ def close_position(symbol):
     pos = get_position(symbol)
     if isinstance(pos, list) and len(pos) > 0:
         amt = float(pos[0].get('positionAmt', 0))
-        if amt > 0: return place_market_order(symbol, "SELL", abs(amt))
-        elif amt < 0: return place_market_order(symbol, "BUY", abs(amt))
+        if amt > 0:
+            return signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol, "side": "SELL", "type": "MARKET",
+                "quantity": abs(amt), "reduceOnly": "true"})
+        elif amt < 0:
+            return signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol, "side": "BUY", "type": "MARKET",
+                "quantity": abs(amt), "reduceOnly": "true"})
     return {"msg": "no position to close"}
 
 def get_symbol_info(symbol):
@@ -374,9 +380,18 @@ def main():
                 # Close any stale short positions from v1 bot
                 if current_pos < 0:
                     print(f"  >>> CLOSING STALE SHORT {sym} (v2 bot is long-only)")
-                    close_position(sym)
+                    result = close_position(sym)
+                    if 'error' in result:
+                        print(f"  ⚠️ FAILED to close {sym}: {result.get('msg','?')}")
+                        # Retry with explicit reduceOnly order
+                        result = signed_request("POST", "/fapi/v1/order", {
+                            "symbol": sym, "side": "BUY", "type": "MARKET",
+                            "quantity": abs(current_pos), "reduceOnly": "true"})
+                    if 'error' not in result:
+                        print(f"  ✅ Closed {sym} short")
                     if sym in state['positions']: del state['positions'][sym]
                     save_state(state)
+                    last_candle_date[sym] = candle_date
                     continue
 
                 price = info.get('price', 0)
